@@ -25,6 +25,7 @@ import { IconButton } from "./button";
 
 import { useAppConfig } from "../store/config";
 import { FileAttachment } from "./file-attachment";
+import { encode } from "../utils/token";
 
 function Details(props: { children: React.ReactNode }) {
   return <details open>{props.children}</details>;
@@ -278,10 +279,58 @@ function tryWrapHtmlCode(text: string) {
 }
 
 function formatThinkText(text: string): string {
-  // 检查是否以 <think> 开头但没有结束标签
+  // 创建一个函数来处理思考时间
+  const handleThinkingTime = (thinkContent: string) => {
+    // 尝试从localStorage获取开始和结束时间
+    try {
+      const thinkStartKey = `think_start_${thinkContent
+        .substring(0, 50)
+        .trim()}`;
+      const thinkEndKey = `think_end_${thinkContent.substring(0, 50).trim()}`;
+
+      // 获取开始时间
+      const startTime = localStorage.getItem(thinkStartKey);
+
+      if (startTime) {
+        // 检查是否已经有结束时间
+        let endTime = localStorage.getItem(thinkEndKey);
+
+        // 如果没有结束时间，才设置当前时间为结束时间
+        if (!endTime) {
+          endTime = Date.now().toString();
+          localStorage.setItem(thinkEndKey, endTime);
+        }
+
+        // 使用结束时间计算持续时间
+        const duration = Math.round(
+          (parseInt(endTime) - parseInt(startTime)) / 1000,
+        );
+        return duration;
+      }
+    } catch (e) {
+      console.error("处理思考时间出错:", e);
+    }
+
+    return null;
+  };
+
+  // 处理正在思考的情况（只有开始标签）
   if (text.startsWith("<think>") && !text.includes("</think>")) {
     // 获取 <think> 后的所有内容
     const thinkContent = text.slice("<think>".length);
+
+    // 保存开始时间到localStorage
+    try {
+      const thinkStartKey = `think_start_${thinkContent
+        .substring(0, 50)
+        .trim()}`;
+      if (!localStorage.getItem(thinkStartKey)) {
+        localStorage.setItem(thinkStartKey, Date.now().toString());
+      }
+    } catch (e) {
+      console.error("保存思考开始时间出错:", e);
+    }
+
     // 给每一行添加引用符号
     const quotedContent = thinkContent
       .split("\n")
@@ -296,7 +345,7 @@ ${quotedContent}
 </details>`;
   }
 
-  // 处理完整的 think 标签
+  // 处理完整的思考过程（有结束标签）
   const pattern = /^<think>([\s\S]*?)<\/think>/;
   return text.replace(pattern, (match, thinkContent) => {
     // 给每一行添加引用符号
@@ -305,8 +354,12 @@ ${quotedContent}
       .map((line: string) => (line.trim() ? `> ${line}` : ">"))
       .join("\n");
 
+    // 获取思考用时
+    const duration = handleThinkingTime(thinkContent);
+    const durationText = duration ? ` (用时 ${duration} 秒)` : "";
+
     return `<details open>
-<summary>${Locale.NewChat.Think}</summary>
+<summary>${Locale.NewChat.Think}${durationText}</summary>
 
 ${quotedContent}
 
@@ -396,6 +449,21 @@ function _MarkDownContent(props: { content: string }) {
         a: (aProps) => {
           const href = aProps.href || "";
 
+          // 检测并阻止javascript协议
+          if (href.toLowerCase().startsWith("javascript:")) {
+            // 返回没有href的链接或替换为安全的替代方案
+            return (
+              <a
+                {...aProps}
+                onClick={(e) => e.preventDefault()}
+                style={{ color: "gray", textDecoration: "line-through" }}
+                title="已阻止不安全链接"
+              >
+                {aProps.children}
+              </a>
+            );
+          }
+
           // 处理文件附件链接
           if (href.startsWith("file://")) {
             try {
@@ -468,10 +536,12 @@ function _MarkDownContent(props: { content: string }) {
             );
           }
 
-          // 处理普通链接
+          // 处理其他安全链接
           const isInternal = /^\/#/i.test(href);
           const target = isInternal ? "_self" : aProps.target ?? "_blank";
-          return <a {...aProps} target={target} />;
+          const rel = !isInternal ? "noopener noreferrer" : undefined;
+
+          return <a {...aProps} href={href} target={target} rel={rel} />;
         },
         pre: PreCode,
         code: CustomCode,
@@ -495,12 +565,107 @@ export function Markdown(
     fontFamily?: string;
     parentRef?: RefObject<HTMLDivElement>;
     defaultShow?: boolean;
+    isUser?: boolean;
+    messageId?: string;
   } & React.DOMAttributes<HTMLDivElement>,
 ) {
   const mdRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const lastContentRef = useRef(props.content);
   const lastScrollTopRef = useRef(0);
+
+  // 添加token计数状态和首字延迟状态
+  const [tokenInfo, setTokenInfo] = useState<{
+    count: number;
+    isUser: boolean;
+    firstCharDelay?: number;
+  } | null>(null);
+  const tokenStartTimeRef = useRef<number | null>(null);
+  const contentLengthRef = useRef<number>(0);
+  const messageStartTimeRef = useRef<number | null>(null);
+  const firstCharReceivedTimeRef = useRef<number | null>(null);
+
+  // 添加鼠标悬停状态
+  const [isHovering, setIsHovering] = useState(false);
+
+  // 初始化消息发送时间
+  useEffect(() => {
+    if (props.loading && !props.isUser && !messageStartTimeRef.current) {
+      // 记录消息开始请求的时间
+      messageStartTimeRef.current = Date.now();
+
+      // 保存到localStorage
+      if (props.messageId) {
+        localStorage.setItem(
+          `msg_start_${props.messageId}`,
+          messageStartTimeRef.current.toString(),
+        );
+      }
+    }
+  }, [props.loading, props.isUser, props.messageId]);
+
+  // 修改token计算逻辑，添加首字延迟计算
+  useEffect(() => {
+    // 如果内容为空或正在加载，重置计时器
+    if (!props.content || props.content.length === 0) {
+      tokenStartTimeRef.current = null;
+      contentLengthRef.current = 0;
+      setTokenInfo(null);
+      return;
+    }
+
+    try {
+      // 只计算token数量，不计算速度
+      const tokens = encode(props.content);
+      const tokenCount = tokens.length;
+
+      // 更新内容长度
+      contentLengthRef.current = props.content.length;
+
+      // 首字延迟计算
+      let firstCharDelay: number | undefined = undefined;
+
+      // 如果是AI回复且是第一次收到内容
+      if (
+        !props.isUser &&
+        props.content.length > 0 &&
+        !firstCharReceivedTimeRef.current
+      ) {
+        firstCharReceivedTimeRef.current = Date.now();
+
+        // 计算延迟时间（毫秒）
+        if (messageStartTimeRef.current) {
+          firstCharDelay =
+            firstCharReceivedTimeRef.current - messageStartTimeRef.current;
+
+          // 保存到localStorage
+          if (props.messageId) {
+            localStorage.setItem(
+              `first_char_delay_${props.messageId}`,
+              firstCharDelay.toString(),
+            );
+          }
+        }
+      } else if (props.messageId) {
+        // 尝试从localStorage获取已存储的延迟
+        const storedDelay = localStorage.getItem(
+          `first_char_delay_${props.messageId}`,
+        );
+        if (storedDelay) {
+          firstCharDelay = parseInt(storedDelay);
+        }
+      }
+
+      // 只设置token数量和首字延迟
+      setTokenInfo({
+        count: tokenCount,
+        isUser: props.isUser ?? false,
+        firstCharDelay,
+      });
+    } catch (e) {
+      console.error("计算token出错:", e);
+    }
+  }, [props.content, props.loading, props.isUser, props.messageId]);
 
   // 检测是否滚动到底部
   const checkIfAtBottom = (target: HTMLDivElement) => {
@@ -538,22 +703,74 @@ export function Markdown(
     lastContentRef.current = props.content;
   }, [props.content, props.parentRef, autoScroll]);
 
+  // 确保在消息完成后仍能获取首字延迟
+  useEffect(() => {
+    // 当消息加载完成时，确保我们仍然能获取到首字延迟
+    if (!props.loading && props.messageId && !props.isUser) {
+      // 尝试从localStorage获取已存储的延迟
+      const storedDelay = localStorage.getItem(
+        `first_char_delay_${props.messageId}`,
+      );
+
+      if (storedDelay && tokenInfo) {
+        // 确保tokenInfo中包含首字延迟
+        if (!tokenInfo.firstCharDelay) {
+          setTokenInfo({
+            ...tokenInfo,
+            firstCharDelay: parseInt(storedDelay),
+          });
+        }
+      }
+    }
+  }, [props.loading, props.messageId, props.isUser, tokenInfo]);
+
   return (
-    <div
-      className="markdown-body"
-      style={{
-        fontSize: `${props.fontSize ?? 14}px`,
-        fontFamily: props.fontFamily || "inherit",
-      }}
-      ref={mdRef}
-      onContextMenu={props.onContextMenu}
-      onDoubleClickCapture={props.onDoubleClickCapture}
-      dir="auto"
-    >
-      {props.loading ? (
-        <LoadingIcon />
-      ) : (
-        <MarkdownContent content={props.content} />
+    <div className="markdown-body-container" style={{ position: "relative" }}>
+      <div
+        className="markdown-body"
+        style={{
+          fontSize: `${props.fontSize ?? 14}px`,
+          fontFamily: props.fontFamily || "inherit",
+        }}
+        ref={mdRef}
+        onContextMenu={props.onContextMenu}
+        onDoubleClickCapture={props.onDoubleClickCapture}
+        dir="auto"
+      >
+        {props.loading ? (
+          <LoadingIcon />
+        ) : (
+          <MarkdownContent content={props.content} />
+        )}
+      </div>
+
+      {/* Token信息显示 */}
+      {!props.loading && tokenInfo && (
+        <div
+          className="token-info"
+          style={{
+            position: "absolute",
+            right: "0px",
+            bottom: "-28px",
+            fontSize: "12px",
+            color: "var(--color-fg-subtle)",
+            opacity: 0.8,
+            whiteSpace: "nowrap",
+            cursor: "pointer",
+          }}
+          onMouseEnter={() => tokenInfo.firstCharDelay && setIsHovering(true)}
+          onMouseLeave={() => setIsHovering(false)}
+          onClick={() => {
+            // 点击时切换显示状态
+            if (tokenInfo.firstCharDelay) {
+              setIsHovering(!isHovering);
+            }
+          }}
+        >
+          {isHovering && tokenInfo.firstCharDelay
+            ? Locale.Chat.TokenInfo.FirstDelay(tokenInfo.firstCharDelay)
+            : Locale.Chat.TokenInfo.TokenCount(tokenInfo.count)}
+        </div>
       )}
     </div>
   );
